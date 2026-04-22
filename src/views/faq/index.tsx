@@ -8,15 +8,15 @@ export const FaqView: FC = () => {
       id: "faq-1",
     },
     {
-      question: "What can I do with my coin?",
+      question: "How long would the process take?",
       answer:
-        "You can allow others to buy it just like Bitcoin or Dogecoin. You would have your own coin on the blockchain which you can manage any way you like.",
+        "The process will only take 5 minutes",
       wallets: undefined,
       id: "faq-2",
     },
     {
-      question: "How do I contact you?",
-      answer: "Message us under the contact tab or email coinownermeme@gmail.com",
+      question: "Where can my meme coin be launched?",
+      answer: "Your meme coin can be launched on Raydium",
       wallets: undefined,
       id: "faq-3",
     },
@@ -28,9 +28,9 @@ export const FaqView: FC = () => {
       id: "faq-4",
     },
     {
-      question: "I have more questions.",
+      question: "What is the creation fee",
       answer:
-        "Contact us anytime and we will answer any questions you have.",
+        "The creation fee is 1 Sol",
       wallets: undefined,
       id: "faq-5",
     },
