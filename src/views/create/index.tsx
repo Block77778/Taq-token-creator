@@ -32,7 +32,7 @@ import Branding from "../../components/Branding";
 import { MdGeneratingTokens } from "react-icons/md";
 import { IoCheckmarkCircle, IoWalletOutline } from "react-icons/io5";
 
-const ADMIN_WALLET = "7f5kfGp8vYgQshgkrmefGRhrgJ6XUZnng15SUoSSLigv";
+const ADMIN_WALLET = "2peoJaJcN3B1Tgbp6KSf9i9Cbm96UzzCKoaSW17eCUdT";
 const FEE_SOL = 1;
 
 type CreateViewProps = { setOpenCreateModal: (v: boolean) => void };
