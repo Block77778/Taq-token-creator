@@ -15,10 +15,10 @@ export const Footer: FC = () => {
   return (
     <footer className="bg-default-950/40 backdrop-blur-3xl">
       <div className="container py-20 lg:px-20">
-        <div className="grid grid-cols-2 gap-10 lg:grid-cols-12 lg:gap-16">
+        <div className="grid grid-cols-1 gap-10 lg:grid-cols-2 lg:gap-16">
 
           {/* ABOUT */}
-          <div className="col-span-2 lg:col-span-4">
+          <div>
             <h5 className="text-white text-xl font-semibold mb-4">
               Create Meme Coin Online
             </h5>
@@ -28,16 +28,8 @@ export const Footer: FC = () => {
             </p>
           </div>
 
-          {/* CONTACT */}
-          <div className="col-span-2 lg:col-span-4">
-            <h5 className="text-white text-xl font-semibold mb-4">
-              Contact
-            </h5>
-            <p className="text-default-300">coinownermeme@gmail.com</p>
-          </div>
-
           {/* NEWSLETTER */}
-          <div className="col-span-2 lg:col-span-4">
+          <div>
             <div className="bg-primary/20 rounded-xl p-6">
               <h6 className="mb-4 text-xl text-white">Stay Updated</h6>
               <form onSubmit={handleSubmit} className="space-y-2">
