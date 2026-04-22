@@ -7,7 +7,6 @@ import {
   SystemProgram,
   Transaction,
   LAMPORTS_PER_SOL,
-  TransactionConfirmationStrategy,
 } from "@solana/web3.js";
 import {
   MINT_SIZE,
@@ -117,21 +116,18 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("payment");
   };
 
-  // Robust confirmation: uses confirmTransaction with strategy object, 
-  // falls back to polling only on timeout — never false-fails on val.err
+  // Confirmation compatible with @solana/web3.js ^1.31
   const confirmWithRetry = async (
     sig: string,
     blockhash: string,
     lastValidBlockHeight: number
   ): Promise<void> => {
-    const strategy: TransactionConfirmationStrategy = {
-      signature: sig,
-      blockhash,
-      lastValidBlockHeight,
-    };
-    const result = await connection.confirmTransaction(strategy, "confirmed");
-    if (result.value.err) {
-      // Get the actual logs to surface the real reason
+    // web3.js 1.31 supports passing a BlockheightBasedTransactionConfirmationStrategy-like object
+    const result = await (connection.confirmTransaction as any)(
+      { signature: sig, blockhash, lastValidBlockHeight },
+      "confirmed"
+    );
+    if (result?.value?.err) {
       const tx = await connection.getTransaction(sig, { commitment: "confirmed" });
       const logs = tx?.meta?.logMessages?.join("\n") || "";
       console.error("Transaction logs:", logs);
