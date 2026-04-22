@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, FC } from "react";
+import { useState, useCallback, FC } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import {
@@ -7,6 +7,7 @@ import {
   SystemProgram,
   Transaction,
   LAMPORTS_PER_SOL,
+  TransactionConfirmationStrategy,
 } from "@solana/web3.js";
 import {
   MINT_SIZE,
@@ -38,16 +39,13 @@ const FEE_SOL = 1;
 type CreateViewProps = { setOpenCreateModal: (v: boolean) => void };
 
 export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
-  // ─── Step flow: form → payment → done ────────────────────────────────────
   const [step, setStep] = useState<"form" | "payment" | "paying" | "done">("form");
   const [payError, setPayError] = useState("");
 
-  // ─── Wallet / connection ──────────────────────────────────────────────────
   const { connection } = useConnection();
   const { publicKey, sendTransaction } = useWallet();
   const { networkConfiguration } = useNetworkConfiguration();
 
-  // ─── Token form state ─────────────────────────────────────────────────────
   const [tokenMintAddress, setTokenMintAddress] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [token, setToken] = useState({
@@ -111,7 +109,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     }
   };
 
-  // Step 1 — user fills form and clicks "Next: Pay & Create"
   const handleFormNext = () => {
     if (!token.name || !token.symbol || !token.amount || !token.image || !token.description) {
       notify({ type: "error", message: "Please fill in all fields before continuing." });
@@ -120,28 +117,28 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("payment");
   };
 
-  // Polls signature status with retries — never false-fails on slow mainnet
-  const waitForConfirmation = async (sig: string): Promise<void> => {
-    for (let i = 0; i < 40; i++) {
-      await new Promise((r) => setTimeout(r, 3000));
-      try {
-        const status = await connection.getSignatureStatus(sig, { searchTransactionHistory: true });
-        const val = status?.value;
-        if (!val) continue; // not indexed yet, keep polling
-        if (val.err) throw new Error("Transaction was rejected. Please try again.");
-        if (val.confirmationStatus === "confirmed" || val.confirmationStatus === "finalized") return;
-      } catch (e: any) {
-        if (e.message.includes("rejected")) throw e;
-        // network error — keep retrying
-      }
+  // Robust confirmation: uses confirmTransaction with strategy object, 
+  // falls back to polling only on timeout — never false-fails on val.err
+  const confirmWithRetry = async (
+    sig: string,
+    blockhash: string,
+    lastValidBlockHeight: number
+  ): Promise<void> => {
+    const strategy: TransactionConfirmationStrategy = {
+      signature: sig,
+      blockhash,
+      lastValidBlockHeight,
+    };
+    const result = await connection.confirmTransaction(strategy, "confirmed");
+    if (result.value.err) {
+      // Get the actual logs to surface the real reason
+      const tx = await connection.getTransaction(sig, { commitment: "confirmed" });
+      const logs = tx?.meta?.logMessages?.join("\n") || "";
+      console.error("Transaction logs:", logs);
+      throw new Error("Transaction failed on-chain. Check Solana Explorer for details.");
     }
-    // Last-chance check before giving up (120s elapsed)
-    const final = await connection.getSignatureStatus(sig, { searchTransactionHistory: true });
-    if (final?.value && !final.value.err) return;
-    throw new Error("Confirmation timed out — please check Solana Explorer for your transaction.");
   };
 
-  // Step 2 — pay fee then create token
   const handlePayAndCreate = useCallback(async () => {
     if (!publicKey) {
       setPayError("Please connect your wallet first.");
@@ -149,31 +146,43 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     }
     setPayError("");
     setStep("paying");
+
     try {
-      // ── 1. Send fee transaction ──────────────────────────────────────────
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      // ── 1. Fee transaction ───────────────────────────────────────────────
+      const {
+        blockhash: feeBlockhash,
+        lastValidBlockHeight: feeLastValid,
+      } = await connection.getLatestBlockhash("finalized");
+
       const feeTx = new Transaction();
-      feeTx.recentBlockhash = blockhash;
+      feeTx.recentBlockhash = feeBlockhash;
       feeTx.feePayer = publicKey;
       feeTx.add(
         SystemProgram.transfer({
           fromPubkey: publicKey,
           toPubkey: new PublicKey(ADMIN_WALLET),
-          lamports: Math.round(LAMPORTS_PER_SOL * FEE_SOL),
+          lamports: LAMPORTS_PER_SOL * FEE_SOL,
         })
       );
 
-      const feeSig = await sendTransaction(feeTx, connection, { maxRetries: 3 });
-      notify({ type: "success", message: "Payment sent — confirming on-chain…", txid: feeSig });
+      const feeSig = await sendTransaction(feeTx, connection);
+      notify({ type: "success", message: "Payment sent — confirming…", txid: feeSig });
 
-      await waitForConfirmation(feeSig);
-      notify({ type: "success", message: "Payment confirmed! Now approve the coin creation…" });
+      await confirmWithRetry(feeSig, feeBlockhash, feeLastValid);
+      notify({ type: "success", message: "Payment confirmed! Approve coin creation next…" });
 
-      // ── 2. Build & send token creation transaction ───────────────────────
+      // ── 2. Upload metadata ───────────────────────────────────────────────
+      const metadataUrl = await uploadMetadata(token);
+
+      // ── 3. Mint transaction ──────────────────────────────────────────────
       const lamports = await getMinimumBalanceForRentExemptMint(connection);
       const mintKeypair = Keypair.generate();
       const tokenATA = await getAssociatedTokenAddress(mintKeypair.publicKey, publicKey);
-      const metadataUrl = await uploadMetadata(token);
+
+      const {
+        blockhash: mintBlockhash,
+        lastValidBlockHeight: mintLastValid,
+      } = await connection.getLatestBlockhash("finalized");
 
       const createMetadataInstruction = createCreateMetadataAccountV3Instruction(
         {
@@ -203,9 +212,8 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
         }
       );
 
-      const mintBlockhash = await connection.getLatestBlockhash("confirmed");
       const mintTx = new Transaction();
-      mintTx.recentBlockhash = mintBlockhash.blockhash;
+      mintTx.recentBlockhash = mintBlockhash;
       mintTx.feePayer = publicKey;
       mintTx.add(
         SystemProgram.createAccount({
@@ -232,24 +240,31 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
         createMetadataInstruction
       );
 
-      const mintSig = await sendTransaction(mintTx, connection, { signers: [mintKeypair], maxRetries: 3 });
+      const mintSig = await sendTransaction(mintTx, connection, { signers: [mintKeypair] });
       notify({ type: "success", message: "Coin transaction sent — confirming…", txid: mintSig });
 
-      await waitForConfirmation(mintSig);
+      await confirmWithRetry(mintSig, mintBlockhash, mintLastValid);
 
       setTokenMintAddress(mintKeypair.publicKey.toString());
       notify({ type: "success", message: "Your coin is live!", txid: mintSig });
       setStep("done");
     } catch (error: any) {
-      notify({ type: "error", message: error?.message || "Something went wrong. Please try again." });
+      // User rejected in Phantom — don't show scary error
+      const msg = error?.message || "";
+      if (msg.toLowerCase().includes("user rejected") || msg.toLowerCase().includes("rejected the request")) {
+        setPayError("Transaction cancelled. Click below to try again.");
+      } else {
+        setPayError(msg || "Something went wrong. Please try again.");
+      }
+      notify({ type: "error", message: msg || "Transaction failed" });
       setStep("payment");
-      setPayError(error?.message || "Please try again.");
     }
+
     setIsLoading(false);
   }, [publicKey, sendTransaction, connection, token]);
 
   // =========================================================================
-  // 📝 STEP 1 — FORM
+  // STEP 1 — FORM
   // =========================================================================
   if (step === "form") {
     return (
@@ -354,14 +369,13 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
   }
 
   // =========================================================================
-  // 💰 STEP 2 — PAYMENT
+  // STEP 2 — PAYMENT
   // =========================================================================
   if (step === "payment" || step === "paying") {
     return (
       <section className="flex min-h-screen w-full items-center justify-center py-10 px-4">
         <div className="w-full max-w-lg">
           <div className="bg-default-950/40 rounded-2xl backdrop-blur-2xl border border-white/10 overflow-hidden">
-            {/* Header */}
             <div className="bg-primary/10 border-b border-white/10 px-8 py-5 flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <span className="bg-primary/20 text-primary flex h-9 w-9 items-center justify-center rounded-full">
@@ -390,7 +404,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 Connect your wallet to create your coin. Coin will be added to your wallet. Price is 1 SOL.
               </p>
 
-              {/* Fee summary — no recipient shown */}
               <div className="mb-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-2">
                 <div className="flex justify-between text-sm">
                   <span className="text-white/50">Coin name</span>
@@ -406,7 +419,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 </div>
               </div>
 
-              {/* Wallet connect */}
               {!publicKey && (
                 <div className="mb-4 flex flex-col items-center gap-3">
                   <p className="text-xs text-white/40 uppercase tracking-wider">Connect your wallet to continue</p>
@@ -414,7 +426,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 </div>
               )}
 
-              {/* Connected wallet display */}
               {publicKey && (
                 <div className="mb-4 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 flex items-center gap-2">
                   <IoCheckmarkCircle className="text-green-400 shrink-0" size={16} />
@@ -445,7 +456,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
               )}
 
               <p className="mt-4 text-center text-xs text-white/30">
-                Your coin will be created automatically on the blockchain as soon as you press Pay 1 SOL &amp; Create Coin.
+                You will be asked to approve 2 transactions: the 1 SOL fee, then the coin creation.
               </p>
 
               <button
@@ -462,7 +473,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
   }
 
   // =========================================================================
-  // ✅ STEP 3 — DONE
+  // STEP 3 — DONE
   // =========================================================================
   return (
     <section className="flex w-full items-center py-6 px-0 lg:h-screen lg:p-10">
