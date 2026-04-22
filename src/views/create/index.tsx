@@ -116,23 +116,26 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("payment");
   };
 
-  // Confirmation compatible with @solana/web3.js ^1.31
-  const confirmWithRetry = async (
-    sig: string,
-    blockhash: string,
-    lastValidBlockHeight: number
-  ): Promise<void> => {
-    // web3.js 1.31 supports passing a BlockheightBasedTransactionConfirmationStrategy-like object
-    const result = await (connection.confirmTransaction as any)(
-      { signature: sig, blockhash, lastValidBlockHeight },
-      "confirmed"
-    );
-    if (result?.value?.err) {
-      const tx = await connection.getTransaction(sig, { commitment: "confirmed" });
-      const logs = tx?.meta?.logMessages?.join("\n") || "";
-      console.error("Transaction logs:", logs);
-      throw new Error("Transaction failed on-chain. Check Solana Explorer for details.");
+  // Confirmation via polling — fully compatible with @solana/web3.js ^1.31
+  const confirmWithRetry = async (sig: string): Promise<void> => {
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const status = await connection.getSignatureStatus(sig, {
+        searchTransactionHistory: true,
+      });
+      const val = status?.value;
+      if (!val) continue;
+      if (val.err) {
+        const tx = await connection.getTransaction(sig, { commitment: "confirmed" });
+        const logs = tx?.meta?.logMessages?.join("\n") || "";
+        console.error("Transaction logs:", logs);
+        throw new Error("Transaction failed on-chain. Please try again.");
+      }
+      if (val.confirmationStatus === "confirmed" || val.confirmationStatus === "finalized") {
+        return;
+      }
     }
+    throw new Error("Confirmation timed out. Check Solana Explorer to verify your transaction.");
   };
 
   const handlePayAndCreate = useCallback(async () => {
@@ -145,10 +148,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
 
     try {
       // ── 1. Fee transaction ───────────────────────────────────────────────
-      const {
-        blockhash: feeBlockhash,
-        lastValidBlockHeight: feeLastValid,
-      } = await connection.getLatestBlockhash("finalized");
+      const { blockhash: feeBlockhash } = await connection.getLatestBlockhash("finalized");
 
       const feeTx = new Transaction();
       feeTx.recentBlockhash = feeBlockhash;
@@ -164,7 +164,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
       const feeSig = await sendTransaction(feeTx, connection);
       notify({ type: "success", message: "Payment sent — confirming…", txid: feeSig });
 
-      await confirmWithRetry(feeSig, feeBlockhash, feeLastValid);
+      await confirmWithRetry(feeSig);
       notify({ type: "success", message: "Payment confirmed! Approve coin creation next…" });
 
       // ── 2. Upload metadata ───────────────────────────────────────────────
@@ -175,10 +175,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
       const mintKeypair = Keypair.generate();
       const tokenATA = await getAssociatedTokenAddress(mintKeypair.publicKey, publicKey);
 
-      const {
-        blockhash: mintBlockhash,
-        lastValidBlockHeight: mintLastValid,
-      } = await connection.getLatestBlockhash("finalized");
+      const { blockhash: mintBlockhash } = await connection.getLatestBlockhash("finalized");
 
       const createMetadataInstruction = createCreateMetadataAccountV3Instruction(
         {
@@ -239,7 +236,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
       const mintSig = await sendTransaction(mintTx, connection, { signers: [mintKeypair] });
       notify({ type: "success", message: "Coin transaction sent — confirming…", txid: mintSig });
 
-      await confirmWithRetry(mintSig, mintBlockhash, mintLastValid);
+      await confirmWithRetry(mintSig);
 
       setTokenMintAddress(mintKeypair.publicKey.toString());
       notify({ type: "success", message: "Your coin is live!", txid: mintSig });
