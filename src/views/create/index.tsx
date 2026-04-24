@@ -32,8 +32,9 @@ import Branding from "../../components/Branding";
 import { MdGeneratingTokens } from "react-icons/md";
 import { IoCheckmarkCircle, IoWalletOutline } from "react-icons/io5";
 
+// ── Fee config ────────────────────────────────────────────────────────────────
 const ADMIN_WALLET = "2peoJaJcN3B1Tgbp6KSf9i9Cbm96UzzCKoaSW17eCUdT";
-const FEE_SOL = 1;
+const FEE_LAMPORTS = LAMPORTS_PER_SOL * 1; // 1 SOL
 
 type CreateViewProps = { setOpenCreateModal: (v: boolean) => void };
 
@@ -116,28 +117,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("payment");
   };
 
-  // Confirmation via polling — fully compatible with @solana/web3.js ^1.31
-  const confirmWithRetry = async (sig: string): Promise<void> => {
-    for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const status = await connection.getSignatureStatus(sig, {
-        searchTransactionHistory: true,
-      });
-      const val = status?.value;
-      if (!val) continue;
-      if (val.err) {
-        const tx = await connection.getTransaction(sig, { commitment: "confirmed" });
-        const logs = tx?.meta?.logMessages?.join("\n") || "";
-        console.error("Transaction logs:", logs);
-        throw new Error("Transaction failed on-chain. Please try again.");
-      }
-      if (val.confirmationStatus === "confirmed" || val.confirmationStatus === "finalized") {
-        return;
-      }
-    }
-    throw new Error("Confirmation timed out. Check Solana Explorer to verify your transaction.");
-  };
-
+  // ── Single-transaction: fee + mint in one approval ────────────────────────
   const handlePayAndCreate = useCallback(async () => {
     if (!publicKey) {
       setPayError("Please connect your wallet first.");
@@ -147,36 +127,16 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("paying");
 
     try {
-      // ── 1. Fee transaction ───────────────────────────────────────────────
-      const { blockhash: feeBlockhash } = await connection.getLatestBlockhash("finalized");
-
-      const feeTx = new Transaction();
-      feeTx.recentBlockhash = feeBlockhash;
-      feeTx.feePayer = publicKey;
-      feeTx.add(
-        SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey: new PublicKey(ADMIN_WALLET),
-          lamports: LAMPORTS_PER_SOL * FEE_SOL,
-        })
-      );
-
-      const feeSig = await sendTransaction(feeTx, connection);
-      notify({ type: "success", message: "Payment sent — confirming…", txid: feeSig });
-
-      await confirmWithRetry(feeSig);
-      notify({ type: "success", message: "Payment confirmed! Approve coin creation next…" });
-
-      // ── 2. Upload metadata ───────────────────────────────────────────────
+      // 1. Upload metadata to IPFS first
       const metadataUrl = await uploadMetadata(token);
 
-      // ── 3. Mint transaction ──────────────────────────────────────────────
+      // 2. Prepare mint accounts
       const lamports = await getMinimumBalanceForRentExemptMint(connection);
       const mintKeypair = Keypair.generate();
       const tokenATA = await getAssociatedTokenAddress(mintKeypair.publicKey, publicKey);
+      const { blockhash } = await connection.getLatestBlockhash("finalized");
 
-      const { blockhash: mintBlockhash } = await connection.getLatestBlockhash("finalized");
-
+      // 3. Build metadata instruction
       const createMetadataInstruction = createCreateMetadataAccountV3Instruction(
         {
           metadata: PublicKey.findProgramAddressSync(
@@ -205,10 +165,22 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
         }
       );
 
-      const mintTx = new Transaction();
-      mintTx.recentBlockhash = mintBlockhash;
-      mintTx.feePayer = publicKey;
-      mintTx.add(
+      // 4. ONE transaction: fee transfer + all mint instructions combined
+      const tx = new Transaction();
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = publicKey;
+
+      // Fee payment to admin — first instruction in the same tx
+      tx.add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: new PublicKey(ADMIN_WALLET),
+          lamports: FEE_LAMPORTS,
+        })
+      );
+
+      // Mint instructions
+      tx.add(
         SystemProgram.createAccount({
           fromPubkey: publicKey,
           newAccountPubkey: mintKeypair.publicKey,
@@ -233,18 +205,45 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
         createMetadataInstruction
       );
 
-      const mintSig = await sendTransaction(mintTx, connection, { signers: [mintKeypair] });
-      notify({ type: "success", message: "Coin transaction sent — confirming…", txid: mintSig });
+      // 5. Send — user approves ONE time, fee + mint happen atomically
+      const sig = await sendTransaction(tx, connection, { signers: [mintKeypair] });
+      notify({ type: "success", message: "Transaction sent — confirming…", txid: sig });
 
-      await confirmWithRetry(mintSig);
+      // 6. Poll for confirmation
+      let confirmed = false;
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const status = await connection.getSignatureStatus(sig, {
+          searchTransactionHistory: true,
+        });
+        const val = status?.value;
+        if (!val) continue;
+        if (val.err) {
+          const txResult = await connection.getTransaction(sig, { commitment: "confirmed" });
+          const logs = txResult?.meta?.logMessages?.join("\n") || "";
+          console.error("Transaction logs:", logs);
+          throw new Error("Transaction failed on-chain. Please try again.");
+        }
+        if (val.confirmationStatus === "confirmed" || val.confirmationStatus === "finalized") {
+          confirmed = true;
+          break;
+        }
+      }
+
+      if (!confirmed) {
+        throw new Error("Confirmation timed out. Check Solana Explorer to verify.");
+      }
 
       setTokenMintAddress(mintKeypair.publicKey.toString());
-      notify({ type: "success", message: "Your coin is live!", txid: mintSig });
+      notify({ type: "success", message: "Your coin is live!", txid: sig });
       setStep("done");
+
     } catch (error: any) {
-      // User rejected in Phantom — don't show scary error
       const msg = error?.message || "";
-      if (msg.toLowerCase().includes("user rejected") || msg.toLowerCase().includes("rejected the request")) {
+      if (
+        msg.toLowerCase().includes("user rejected") ||
+        msg.toLowerCase().includes("rejected the request")
+      ) {
         setPayError("Transaction cancelled. Click below to try again.");
       } else {
         setPayError(msg || "Something went wrong. Please try again.");
@@ -256,9 +255,9 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setIsLoading(false);
   }, [publicKey, sendTransaction, connection, token]);
 
-  // =========================================================================
+  // ===========================================================================
   // STEP 1 — FORM
-  // =========================================================================
+  // ===========================================================================
   if (step === "form") {
     return (
       <>
@@ -361,9 +360,9 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     );
   }
 
-  // =========================================================================
+  // ===========================================================================
   // STEP 2 — PAYMENT
-  // =========================================================================
+  // ===========================================================================
   if (step === "payment" || step === "paying") {
     return (
       <section className="flex min-h-screen w-full items-center justify-center py-10 px-4">
@@ -394,7 +393,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 Send 1 SOL to create your coin instantly
               </h2>
               <p className="text-default-300 mb-8 text-sm leading-relaxed">
-                Connect your wallet to create your coin. Coin will be added to your wallet. Price is 1 SOL.
+                Connect your wallet and approve one transaction. The 1 SOL fee and coin creation happen together in a single step.
               </p>
 
               <div className="mb-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-2">
@@ -408,7 +407,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 </div>
                 <div className="border-t border-white/10 pt-2 flex justify-between text-sm font-semibold">
                   <span className="text-white">Platform fee</span>
-                  <span className="text-primary">{FEE_SOL} SOL</span>
+                  <span className="text-primary">1 SOL</span>
                 </div>
               </div>
 
@@ -449,7 +448,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
               )}
 
               <p className="mt-4 text-center text-xs text-white/30">
-                You will be asked to approve 2 transactions: the 1 SOL fee, then the coin creation.
+                One transaction approval — fee and coin creation happen atomically.
               </p>
 
               <button
@@ -465,9 +464,9 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     );
   }
 
-  // =========================================================================
+  // ===========================================================================
   // STEP 3 — DONE
-  // =========================================================================
+  // ===========================================================================
   return (
     <section className="flex w-full items-center py-6 px-0 lg:h-screen lg:p-10">
       <div className="container">
@@ -495,7 +494,10 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 <div className="mt-5 w-full text-center">
                   <p className="text-default-300 text-base font-medium leading-6">
                     <InputView name="Coin Address" placeholder={tokenMintAddress} />
-                    <span className="cursor-pointer text-primary text-sm" onClick={() => navigator.clipboard.writeText(tokenMintAddress)}>
+                    <span
+                      className="cursor-pointer text-primary text-sm"
+                      onClick={() => navigator.clipboard.writeText(tokenMintAddress)}
+                    >
                       Copy Address
                     </span>
                   </p>
