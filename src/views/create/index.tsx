@@ -32,9 +32,8 @@ import Branding from "../../components/Branding";
 import { MdGeneratingTokens } from "react-icons/md";
 import { IoCheckmarkCircle, IoWalletOutline } from "react-icons/io5";
 
-// ── Fee config ────────────────────────────────────────────────────────────────
 const ADMIN_WALLET = "2peoJaJcN3B1Tgbp6KSf9i9Cbm96UzzCKoaSW17eCUdT";
-const FEE_LAMPORTS = LAMPORTS_PER_SOL * 1; // 1 SOL
+const FEE_LAMPORTS = LAMPORTS_PER_SOL * 1;
 
 type CreateViewProps = { setOpenCreateModal: (v: boolean) => void };
 
@@ -43,7 +42,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
   const [payError, setPayError] = useState("");
 
   const { connection } = useConnection();
-  const { publicKey, sendTransaction } = useWallet();
+  const { publicKey, signTransaction } = useWallet();
   const { networkConfiguration } = useNetworkConfiguration();
 
   const [tokenMintAddress, setTokenMintAddress] = useState("");
@@ -77,17 +76,15 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     return `https://gateway.pinata.cloud/ipfs/${response.data.IpfsHash}`;
   };
 
-  const uploadMetadata = async (token: any): Promise<string> => {
+  const uploadMetadata = async (tokenData: any): Promise<string> => {
     setIsLoading(true);
-    const { name, symbol, description, image } = token;
-    if (!name || !symbol || !description || !image) {
-      throw new Error("Data Missing");
-    }
+    const { name, symbol, description, image } = tokenData;
+    if (!name || !symbol || !description || !image) throw new Error("Data Missing");
     const data = JSON.stringify({ name, symbol, description, image });
     const response = await axios({
       method: "POST",
       url: "https://api.pinata.cloud/pinning/pinJSONToIPFS",
-      data: data,
+      data,
       headers: {
         pinata_api_key: `4c1abdcc51b983d48932`,
         pinata_secret_api_key: `4320b65a52e1d0b93be2c2ccb5bea8ca87e58ef545c513af5c6031770c658dd7`,
@@ -103,7 +100,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
       try {
         const imgUrl = await uploadImagePinata(file);
         setToken({ ...token, image: imgUrl });
-      } catch (error: any) {
+      } catch {
         notify({ type: "error", message: "Upload image failed" });
       }
     }
@@ -117,9 +114,8 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("payment");
   };
 
-  // ── Single-transaction: fee + mint in one approval ────────────────────────
   const handlePayAndCreate = useCallback(async () => {
-    if (!publicKey) {
+    if (!publicKey || !signTransaction) {
       setPayError("Please connect your wallet first.");
       return;
     }
@@ -127,22 +123,24 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("paying");
 
     try {
-      // 1. Upload metadata to IPFS first
+      // 1. Upload metadata to IPFS
       const metadataUrl = await uploadMetadata(token);
 
-      // 2. Prepare mint accounts
+      // 2. Prepare accounts
       const lamports = await getMinimumBalanceForRentExemptMint(connection);
       const mintKeypair = Keypair.generate();
       const tokenATA = await getAssociatedTokenAddress(mintKeypair.publicKey, publicKey);
-      const { blockhash } = await connection.getLatestBlockhash("finalized");
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
 
       // 3. Build metadata instruction
+      const metadataPDA = PublicKey.findProgramAddressSync(
+        [Buffer.from("metadata"), PROGRAM_ID.toBuffer(), mintKeypair.publicKey.toBuffer()],
+        PROGRAM_ID
+      )[0];
+
       const createMetadataInstruction = createCreateMetadataAccountV3Instruction(
         {
-          metadata: PublicKey.findProgramAddressSync(
-            [Buffer.from("metadata"), PROGRAM_ID.toBuffer(), mintKeypair.publicKey.toBuffer()],
-            PROGRAM_ID
-          )[0],
+          metadata: metadataPDA,
           mint: mintKeypair.publicKey,
           mintAuthority: publicKey,
           payer: publicKey,
@@ -165,22 +163,19 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
         }
       );
 
-      // 4. ONE transaction: fee transfer + all mint instructions combined
+      // 4. Build single transaction with fee + mint instructions
       const tx = new Transaction();
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
-      // Fee payment to admin — first instruction in the same tx
       tx.add(
+        // Fee to admin wallet
         SystemProgram.transfer({
           fromPubkey: publicKey,
           toPubkey: new PublicKey(ADMIN_WALLET),
           lamports: FEE_LAMPORTS,
-        })
-      );
-
-      // Mint instructions
-      tx.add(
+        }),
+        // Create mint account
         SystemProgram.createAccount({
           fromPubkey: publicKey,
           newAccountPubkey: mintKeypair.publicKey,
@@ -188,6 +183,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
           lamports,
           programId: TOKEN_PROGRAM_ID,
         }),
+        // Initialize mint
         createInitializeMintInstruction(
           mintKeypair.publicKey,
           Number(token.decimals),
@@ -195,21 +191,42 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
           publicKey,
           TOKEN_PROGRAM_ID
         ),
-        createAssociatedTokenAccountInstruction(publicKey, tokenATA, publicKey, mintKeypair.publicKey),
+        // Create associated token account
+        createAssociatedTokenAccountInstruction(
+          publicKey,
+          tokenATA,
+          publicKey,
+          mintKeypair.publicKey
+        ),
+        // Mint tokens to user
         createMintToInstruction(
           mintKeypair.publicKey,
           tokenATA,
           publicKey,
           Number(token.amount) * Math.pow(10, Number(token.decimals))
         ),
+        // Set metadata
         createMetadataInstruction
       );
 
-      // 5. Send — user approves ONE time, fee + mint happen atomically
-      const sig = await sendTransaction(tx, connection, { signers: [mintKeypair] });
+      // 5. mintKeypair signs first (non-interactive signer)
+      tx.partialSign(mintKeypair);
+
+      // 6. Simulate before sending — catches failures before Phantom shows warning
+      await connection.simulateTransaction(tx, { sigVerify: false } as any);
+
+      // 7. Phantom signs via signTransaction (single interactive signer = no warning)
+      const signedTx = await signTransaction(tx);
+
+      // 8. Send raw transaction
+      const sig = await connection.sendRawTransaction(signedTx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      });
+
       notify({ type: "success", message: "Transaction sent — confirming…", txid: sig });
 
-      // 6. Poll for confirmation
+      // 9. Poll for confirmation
       let confirmed = false;
       for (let i = 0; i < 60; i++) {
         await new Promise((r) => setTimeout(r, 2000));
@@ -230,9 +247,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
         }
       }
 
-      if (!confirmed) {
-        throw new Error("Confirmation timed out. Check Solana Explorer to verify.");
-      }
+      if (!confirmed) throw new Error("Confirmation timed out. Check Solana Explorer to verify.");
 
       setTokenMintAddress(mintKeypair.publicKey.toString());
       notify({ type: "success", message: "Your coin is live!", txid: sig });
@@ -253,7 +268,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     }
 
     setIsLoading(false);
-  }, [publicKey, sendTransaction, connection, token]);
+  }, [publicKey, signTransaction, connection, token]);
 
   // ===========================================================================
   // STEP 1 — FORM
@@ -298,7 +313,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                     <p className="text-default-300 mb-8 max-w-sm">
                       Fill in your coin details below.
                     </p>
-
                     <div className="text-start">
                       {token.image ? (
                         <div className="flex lg:hidden items-start justify-center">
@@ -319,18 +333,15 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                           </div>
                         </div>
                       )}
-
                       <textarea
                         onChange={(e) => handleFormFieldChange("description", e)}
                         className="border-default-200 mt-4 relative lg:hidden block w-full rounded border-white/10 bg-transparent py-1.5 px-3 text-white/80 focus:border-white/25 focus:ring-transparent"
                         rows={3}
                         placeholder="Description of your coin..."
                       />
-
                       <InputView name="Name" placeholder="Coin name" clickhandle={(e) => handleFormFieldChange("name", e)} />
                       <InputView name="Symbol" placeholder="Coin symbol (e.g. DOGE)" clickhandle={(e) => handleFormFieldChange("symbol", e)} />
                       <InputView name="Supply" placeholder="Total supply (e.g. 1000000)" clickhandle={(e) => handleFormFieldChange("amount", e)} />
-
                       <div className="mb-6 text-center">
                         <button
                           onClick={handleFormNext}
@@ -342,7 +353,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                       </div>
                     </div>
                   </div>
-
                   <div className="text-center">
                     <a
                       onClick={() => setOpenCreateModal(false)}
@@ -384,7 +394,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 <AiOutlineClose size={14} />
               </button>
             </div>
-
             <div className="p-8">
               <span className="text-primary bg-primary/20 mb-6 inline-block rounded-md px-3 py-1 text-xs font-medium uppercase tracking-wider">
                 Create Coin in 60 Seconds
@@ -395,7 +404,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
               <p className="text-default-300 mb-8 text-sm leading-relaxed">
                 Connect your wallet and approve one transaction. The 1 SOL fee and coin creation happen together in a single step.
               </p>
-
               <div className="mb-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-2">
                 <div className="flex justify-between text-sm">
                   <span className="text-white/50">Coin name</span>
@@ -410,21 +418,18 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                   <span className="text-primary">1 SOL</span>
                 </div>
               </div>
-
               {!publicKey && (
                 <div className="mb-4 flex flex-col items-center gap-3">
                   <p className="text-xs text-white/40 uppercase tracking-wider">Connect your wallet to continue</p>
                   <WalletMultiButton />
                 </div>
               )}
-
               {publicKey && (
                 <div className="mb-4 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 flex items-center gap-2">
                   <IoCheckmarkCircle className="text-green-400 shrink-0" size={16} />
                   <span className="text-white/70 font-mono text-xs truncate">{publicKey.toBase58()}</span>
                 </div>
               )}
-
               <button
                 onClick={handlePayAndCreate}
                 disabled={!publicKey || step === "paying"}
@@ -442,15 +447,12 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                   </>
                 )}
               </button>
-
               {payError && (
                 <p className="mt-3 text-center text-xs text-red-400">{payError}</p>
               )}
-
               <p className="mt-4 text-center text-xs text-white/30">
                 One transaction approval — fee and coin creation happen atomically.
               </p>
-
               <button
                 onClick={() => setStep("form")}
                 className="mt-4 w-full text-center text-xs text-white/30 hover:text-white/60 transition-colors"
