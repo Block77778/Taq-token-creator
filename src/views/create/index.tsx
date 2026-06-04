@@ -212,10 +212,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
       // 5. mintKeypair signs first (non-interactive signer)
       tx.partialSign(mintKeypair);
 
-      // 6. Simulate before sending — catches failures before Phantom shows warning
-      await connection.simulateTransaction(tx, { sigVerify: false } as any);
-
-      // 7. Phantom signs via signTransaction (single interactive signer = no warning)
+      // 6. Phantom signs via signTransaction (single interactive signer = no warning)
       const signedTx = await signTransaction(tx);
 
       // 8. Send raw transaction
