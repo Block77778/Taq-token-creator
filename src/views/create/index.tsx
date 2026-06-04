@@ -42,7 +42,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
   const [payError, setPayError] = useState("");
 
   const { connection } = useConnection();
-  const { publicKey, signTransaction } = useWallet();
+  const { publicKey, signTransaction, signAllTransactions } = useWallet();
   const { networkConfiguration } = useNetworkConfiguration();
 
   const [tokenMintAddress, setTokenMintAddress] = useState("");
@@ -114,8 +114,23 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("payment");
   };
 
+  // Poll confirmation helper
+  const waitForConfirmation = async (sig: string): Promise<void> => {
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const status = await connection.getSignatureStatus(sig, {
+        searchTransactionHistory: true,
+      });
+      const val = status?.value;
+      if (!val) continue;
+      if (val.err) throw new Error("Transaction failed on-chain. Please try again.");
+      if (val.confirmationStatus === "confirmed" || val.confirmationStatus === "finalized") return;
+    }
+    throw new Error("Confirmation timed out. Check Solana Explorer.");
+  };
+
   const handlePayAndCreate = useCallback(async () => {
-    if (!publicKey || !signTransaction) {
+    if (!publicKey || !signTransaction || !signAllTransactions) {
       setPayError("Please connect your wallet first.");
       return;
     }
@@ -123,59 +138,38 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     setStep("paying");
 
     try {
-      // 1. Upload metadata to IPFS
+      // ── Step 1: Upload metadata ──────────────────────────────────────────
       const metadataUrl = await uploadMetadata(token);
 
-      // 2. Prepare accounts
+      // ── Step 2: Prepare mint accounts ───────────────────────────────────
       const lamports = await getMinimumBalanceForRentExemptMint(connection);
       const mintKeypair = Keypair.generate();
       const tokenATA = await getAssociatedTokenAddress(mintKeypair.publicKey, publicKey);
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
 
-      // 3. Build metadata instruction
       const metadataPDA = PublicKey.findProgramAddressSync(
         [Buffer.from("metadata"), PROGRAM_ID.toBuffer(), mintKeypair.publicKey.toBuffer()],
         PROGRAM_ID
       )[0];
 
-      const createMetadataInstruction = createCreateMetadataAccountV3Instruction(
-        {
-          metadata: metadataPDA,
-          mint: mintKeypair.publicKey,
-          mintAuthority: publicKey,
-          payer: publicKey,
-          updateAuthority: publicKey,
-        },
-        {
-          createMetadataAccountArgsV3: {
-            data: {
-              name: token.name,
-              symbol: token.symbol,
-              uri: metadataUrl,
-              creators: null,
-              sellerFeeBasisPoints: 0,
-              uses: null,
-              collection: null,
-            },
-            isMutable: false,
-            collectionDetails: null,
-          },
-        }
-      );
+      const { blockhash } = await connection.getLatestBlockhash("finalized");
 
-      // 4. Build single transaction with fee + mint instructions
-      const tx = new Transaction();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = publicKey;
-
-      tx.add(
-        // Fee to admin wallet
+      // ── Tx A: Fee only — 1 signer (user), no warning ────────────────────
+      const feeTx = new Transaction();
+      feeTx.recentBlockhash = blockhash;
+      feeTx.feePayer = publicKey;
+      feeTx.add(
         SystemProgram.transfer({
           fromPubkey: publicKey,
           toPubkey: new PublicKey(ADMIN_WALLET),
           lamports: FEE_LAMPORTS,
-        }),
-        // Create mint account
+        })
+      );
+
+      // ── Tx B: Mint — mintKeypair pre-signs, user is only interactive signer ──
+      const mintTx = new Transaction();
+      mintTx.recentBlockhash = blockhash;
+      mintTx.feePayer = publicKey;
+      mintTx.add(
         SystemProgram.createAccount({
           fromPubkey: publicKey,
           newAccountPubkey: mintKeypair.publicKey,
@@ -183,7 +177,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
           lamports,
           programId: TOKEN_PROGRAM_ID,
         }),
-        // Initialize mint
         createInitializeMintInstruction(
           mintKeypair.publicKey,
           Number(token.decimals),
@@ -191,63 +184,68 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
           publicKey,
           TOKEN_PROGRAM_ID
         ),
-        // Create associated token account
         createAssociatedTokenAccountInstruction(
           publicKey,
           tokenATA,
           publicKey,
           mintKeypair.publicKey
         ),
-        // Mint tokens to user
         createMintToInstruction(
           mintKeypair.publicKey,
           tokenATA,
           publicKey,
           Number(token.amount) * Math.pow(10, Number(token.decimals))
         ),
-        // Set metadata
-        createMetadataInstruction
+        createCreateMetadataAccountV3Instruction(
+          {
+            metadata: metadataPDA,
+            mint: mintKeypair.publicKey,
+            mintAuthority: publicKey,
+            payer: publicKey,
+            updateAuthority: publicKey,
+          },
+          {
+            createMetadataAccountArgsV3: {
+              data: {
+                name: token.name,
+                symbol: token.symbol,
+                uri: metadataUrl,
+                creators: null,
+                sellerFeeBasisPoints: 0,
+                uses: null,
+                collection: null,
+              },
+              isMutable: false,
+              collectionDetails: null,
+            },
+          }
+        )
       );
 
-      // 5. mintKeypair signs first (non-interactive signer)
-      tx.partialSign(mintKeypair);
+      // mintKeypair pre-signs Tx B — so Phantom only sees user as signer
+      mintTx.partialSign(mintKeypair);
 
-      // 6. Phantom signs via signTransaction (single interactive signer = no warning)
-      const signedTx = await signTransaction(tx);
+      // ── Step 3: User signs BOTH transactions in one Phantom popup ────────
+      // signAllTransactions shows one approval for both — clean UX, no warning
+      const [signedFeeTx, signedMintTx] = await signAllTransactions([feeTx, mintTx]);
 
-      // 8. Send raw transaction
-      const sig = await connection.sendRawTransaction(signedTx.serialize(), {
+      // ── Step 4: Send fee tx first, wait, then send mint tx ───────────────
+      notify({ type: "success", message: "Sending fee transaction…" });
+      const feeSig = await connection.sendRawTransaction(signedFeeTx.serialize(), {
         skipPreflight: false,
         preflightCommitment: "confirmed",
       });
+      await waitForConfirmation(feeSig);
+      notify({ type: "success", message: "Fee confirmed! Creating your coin…", txid: feeSig });
 
-      notify({ type: "success", message: "Transaction sent — confirming…", txid: sig });
-
-      // 9. Poll for confirmation
-      let confirmed = false;
-      for (let i = 0; i < 60; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const status = await connection.getSignatureStatus(sig, {
-          searchTransactionHistory: true,
-        });
-        const val = status?.value;
-        if (!val) continue;
-        if (val.err) {
-          const txResult = await connection.getTransaction(sig, { commitment: "confirmed" });
-          const logs = txResult?.meta?.logMessages?.join("\n") || "";
-          console.error("Transaction logs:", logs);
-          throw new Error("Transaction failed on-chain. Please try again.");
-        }
-        if (val.confirmationStatus === "confirmed" || val.confirmationStatus === "finalized") {
-          confirmed = true;
-          break;
-        }
-      }
-
-      if (!confirmed) throw new Error("Confirmation timed out. Check Solana Explorer to verify.");
+      const mintSig = await connection.sendRawTransaction(signedMintTx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      });
+      await waitForConfirmation(mintSig);
 
       setTokenMintAddress(mintKeypair.publicKey.toString());
-      notify({ type: "success", message: "Your coin is live!", txid: sig });
+      notify({ type: "success", message: "Your coin is live!", txid: mintSig });
       setStep("done");
 
     } catch (error: any) {
@@ -265,7 +263,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
     }
 
     setIsLoading(false);
-  }, [publicKey, signTransaction, connection, token]);
+  }, [publicKey, signTransaction, signAllTransactions, connection, token]);
 
   // ===========================================================================
   // STEP 1 — FORM
@@ -301,7 +299,6 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                     placeholder="Description of your coin..."
                   />
                 </div>
-
                 <div className="lg:ps-0 flex flex-col p-10">
                   <div className="pb6 my-auto">
                     <h4 className="mb-4 mt-48 lg:mt-0 text-2xl font-bold text-white">
@@ -399,7 +396,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 Send 1 SOL to create your coin instantly
               </h2>
               <p className="text-default-300 mb-8 text-sm leading-relaxed">
-                Connect your wallet and approve one transaction. The 1 SOL fee and coin creation happen together in a single step.
+                Connect your wallet and approve. Fee and coin creation happen in one step.
               </p>
               <div className="mb-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-2">
                 <div className="flex justify-between text-sm">
@@ -448,7 +445,7 @@ export const CreateView: FC<CreateViewProps> = ({ setOpenCreateModal }) => {
                 <p className="mt-3 text-center text-xs text-red-400">{payError}</p>
               )}
               <p className="mt-4 text-center text-xs text-white/30">
-                One transaction approval — fee and coin creation happen atomically.
+                Phantom will show 2 transactions to approve at once — fee then mint.
               </p>
               <button
                 onClick={() => setStep("form")}
